@@ -1,241 +1,524 @@
-import os
+#!/usr/bin/env python3
+"""
+fileMerger — Universal File Merger
+====================================
+Recursively scans a directory, extracts text content from supported file
+types, optionally removes duplicate content, and combines everything into
+a single Markdown file.
+
+Supported formats: .txt, .md, .json, .csv, .xlsx, .pdf, .docx, .pptx, .ipynb
+
+Usage:
+    python fileMerger.py [--directory DIR] [--output FILE] [--csv-limit N]
+                         [--json-limit N] [--exclude DIR ...] [--no-dedup]
+                         [--verbose] [--quiet]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
 import sys
+from pathlib import Path
+from typing import Optional
 
-# Define target output filename
-OUTPUT_FILENAME = "Combined_File.md"
-SCRIPT_SELF_NAME = "fileMerger.py"
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
 
-# Get absolute path of the output file to guarantee it is safely excluded from scanning
-OUTPUT_FILEPATH_ABS = os.path.abspath(OUTPUT_FILENAME)
+import nbformat
+import pandas as pd
+from docx import Document
+from pypdf import PdfReader
+from pptx import Presentation
 
-# Global memory set to track and eliminate exact duplicate text blocks across files
-seen_content = set()
 
-# Mapping text/code extensions to their respective Markdown block code-syntax highlights
-CODE_EXTENSIONS = {
-    '.py': 'python',
-    '.ipynb': 'json', # Read as raw structured text if nbformat fails
-    '.md': 'markdown',
-    '.txt': 'text',
-    '.json': 'json',
-    '.js': 'javascript',
-    '.html': 'html',
-    '.css': 'css',
-    '.xml': 'xml',
-    '.yaml': 'yaml',
-    '.yml': 'yaml',
-    '.sh': 'bash',
-    '.bat': 'batch',
-    '.ini': 'ini',
-    '.cfg': 'ini',
-    '.log': 'text',
-    '.csv': 'text', # Fallback highlight if pandas/tabulate are absent
-    '.tsv': 'text'
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SUPPORTED_EXTENSIONS: set[str] = {
+    ".txt",
+    ".md",
+    ".json",
+    ".csv",
+    ".xlsx",
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".ipynb",
 }
 
-RICH_EXTENSIONS = ('.docx', '.pdf', '.xlsx', '.xls', '.pptx', '.csv', '.tsv')
-ALL_SUPPORTED_EXTENSIONS = tuple(list(CODE_EXTENSIONS.keys()) + list(RICH_EXTENSIONS))
+# Directories skipped by default during recursive scan
+DEFAULT_EXCLUDE_DIRS: set[str] = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    ".env",
+    "dist",
+    "build",
+    "target",
+    ".idea",
+    ".vscode",
+}
 
-def read_text_with_fallback_encodings(filepath):
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    """Return a lowercased, whitespace-collapsed version of *text* for comparison."""
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+class Deduplicator:
     """
-    Attempts to read text files using multiple encoding safe nets to avoid 
-    crashing on exotic, legacy, or system-specific text characters.
+    Tracks seen content blocks and reports duplicates.
+
+    Deduplication is intentionally opt-in and scoped per run.  Content is
+    compared after lowercasing and whitespace normalisation so that trivially
+    equivalent blocks (different capitalisation, extra blank lines) are caught.
     """
-    encodings = ['utf-8', 'latin-1', 'cp1252', 'utf-16']
-    for encoding in encodings:
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+        self.duplicates_removed: int = 0
+
+    def is_new(self, text: str) -> bool:
+        """Return True and record *text* if it has not been seen before."""
+        key = _normalize(text)
+        if not key:
+            return False
+        if key in self._seen:
+            self.duplicates_removed += 1
+            return False
+        self._seen.add(key)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Per-format extractors
+# ---------------------------------------------------------------------------
+
+def extract_text(path: Path, dedup: Optional[Deduplicator]) -> str:
+    text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not text:
+        return ""
+    if dedup is not None and not dedup.is_new(text):
+        return ""
+    return text
+
+
+def extract_json(path: Path, dedup: Optional[Deduplicator], json_limit: int) -> str:
+    raw = path.read_text(encoding="utf-8", errors="ignore")
+    try:
+        data = json.loads(raw)
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+    except json.JSONDecodeError as exc:
+        return f"*Could not parse JSON: {exc}*"
+
+    if json_limit > 0 and len(text) > json_limit:
+        preview = text[:json_limit]
+        note = (
+            f"\n\n*JSON truncated: showing first {json_limit:,} of "
+            f"{len(text):,} characters.*"
+        )
+        block = f"```json\n{preview}\n```{note}"
+    else:
+        block = f"```json\n{text}\n```"
+
+    if dedup is not None and not dedup.is_new(text):
+        return ""
+    return block
+
+
+def extract_csv(
+    path: Path, dedup: Optional[Deduplicator], csv_limit: int
+) -> str:
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        return f"*Could not read CSV: {exc}*"
+
+    if df.empty:
+        return ""
+
+    if csv_limit > 0 and len(df) > csv_limit:
+        table = df.head(csv_limit).to_markdown(index=False)
+        table += f"\n\n*Showing first {csv_limit} of {len(df):,} rows.*"
+    else:
+        table = df.to_markdown(index=False)
+
+    if dedup is not None and not dedup.is_new(table):
+        return ""
+    return table
+
+
+def extract_xlsx(
+    path: Path, dedup: Optional[Deduplicator], csv_limit: int
+) -> str:
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as exc:
+        return f"*Could not open workbook: {exc}*"
+
+    parts: list[str] = []
+
+    for sheet_name in xl.sheet_names:
         try:
-            with open(filepath, 'r', encoding=encoding, errors='ignore') as f:
-                return f.read().strip()
-        except Exception:
+            df = xl.parse(sheet_name)
+        except Exception as exc:
+            parts.append(f"#### Sheet: {sheet_name}\n\n*Error reading sheet: {exc}*")
             continue
+
+        if df.empty:
+            continue
+
+        if csv_limit > 0 and len(df) > csv_limit:
+            table = df.head(csv_limit).to_markdown(index=False)
+            table += (
+                f"\n\n*Showing first {csv_limit} of {len(df):,} rows "
+                f"in sheet '{sheet_name}'.*"
+            )
+        else:
+            table = df.to_markdown(index=False)
+
+        if dedup is None or dedup.is_new(table):
+            parts.append(f"#### Sheet: {sheet_name}\n\n{table}")
+
+    return "\n\n".join(parts)
+
+
+def extract_pdf(path: Path, dedup: Optional[Deduplicator]) -> str:
+    reader = PdfReader(path)
+    parts: list[str] = []
+
+    for i, page in enumerate(reader.pages, start=1):
+        text = page.extract_text()
+        if not text:
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        # Deduplicate at the full-document level, not per page, to avoid
+        # silently dropping repeated headers/footers.
+        parts.append(f"<!-- page {i} -->\n{text}")
+
+    combined = "\n\n".join(parts)
+    if not combined:
+        return ""
+    if dedup is not None and not dedup.is_new(combined):
+        return ""
+    return combined
+
+
+def extract_docx(path: Path, dedup: Optional[Deduplicator]) -> str:
+    doc = Document(path)
+    parts: list[str] = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        if dedup is None or dedup.is_new(text):
+            parts.append(text)
+
+    return "\n\n".join(parts)
+
+
+def extract_pptx(path: Path, dedup: Optional[Deduplicator]) -> str:
+    prs = Presentation(path)
+    slides: list[str] = []
+
+    for i, slide in enumerate(prs.slides, start=1):
+        content: list[str] = []
+
+        for shape in slide.shapes:
+            if not hasattr(shape, "text"):
+                continue
+            text = shape.text.strip()
+            if not text:
+                continue
+            if dedup is None or dedup.is_new(text):
+                content.append(text)
+
+        if content:
+            slides.append(f"### Slide {i}\n\n" + "\n\n".join(content))
+
+    return "\n\n".join(slides)
+
+
+def extract_notebook(path: Path, dedup: Optional[Deduplicator]) -> str:
+    nb = nbformat.read(path, as_version=4)
+    parts: list[str] = []
+
+    for cell in nb.cells:
+        content = cell.source.strip()
+        if not content:
+            continue
+        if dedup is not None and not dedup.is_new(content):
+            continue
+
+        if cell.cell_type == "markdown":
+            parts.append(content)
+        elif cell.cell_type == "code":
+            parts.append(f"```python\n{content}\n```")
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+def extract_file(
+    path: Path,
+    dedup: Optional[Deduplicator],
+    csv_limit: int,
+    json_limit: int,
+) -> str:
+    suffix = path.suffix.lower()
+
+    try:
+        if suffix in (".txt", ".md"):
+            return extract_text(path, dedup)
+        if suffix == ".json":
+            return extract_json(path, dedup, json_limit)
+        if suffix == ".csv":
+            return extract_csv(path, dedup, csv_limit)
+        if suffix == ".xlsx":
+            return extract_xlsx(path, dedup, csv_limit)
+        if suffix == ".pdf":
+            return extract_pdf(path, dedup)
+        if suffix == ".docx":
+            return extract_docx(path, dedup)
+        if suffix == ".pptx":
+            return extract_pptx(path, dedup)
+        if suffix == ".ipynb":
+            return extract_notebook(path, dedup)
+    except Exception as exc:
+        return f"*Error processing file: {exc}*"
+
     return ""
 
-def extract_notebook_content(filepath):
-    """Extracts markdown and code from an Jupyter Notebook with standard fallback protection."""
-    try:
-        import nbformat
-        content = []
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            nb = nbformat.read(f, as_version=4)
-            for cell in nb.cells:
-                cell_text = cell.source.strip()
-                if not cell_text: 
-                    continue
-                if cell_text not in seen_content:
-                    seen_content.add(cell_text)
-                    if cell.cell_type == 'markdown':
-                        content.append(cell_text)
-                    elif cell.cell_type == 'code':
-                        content.append(f"```python\n{cell_text}\n```")
-        return "\n\n".join(content)
-    except ImportError:
-        # Fallback if nbformat is missing: Read it gracefully as syntax-wrapped raw JSON text
-        raw_json = read_text_with_fallback_encodings(filepath)
-        return f"*Note: 'nbformat' missing. Displaying raw Notebook text layout.*\n\n```json\n{raw_json}\n```"
-    except Exception as e:
-        return f"*Error parsing Notebook file details: {e}*"
 
-def extract_docx_content(filepath):
-    """Extracts paragraphs from Microsoft Word documents."""
-    try:
-        import docx
-        content = []
-        doc = docx.Document(filepath)
-        for paragraph in doc.paragraphs:
-            para_text = paragraph.text.strip()
-            if not para_text: 
-                continue
-            if para_text not in seen_content:
-                seen_content.add(para_text)
-                content.append(para_text)
-        return "\n\n".join(content)
-    except ImportError:
-        return "*[Dependency Missing: Install 'python-docx' via pip to parse this Word document]*"
-    except Exception as e:
-        return f"*Error parsing Word document text stream: {e}*"
+# ---------------------------------------------------------------------------
+# File discovery
+# ---------------------------------------------------------------------------
 
-def extract_pdf_content(filepath):
-    """Extracts raw text streams layout from PDF documents."""
-    try:
-        from pypdf import PdfReader
-        content = []
-        reader = PdfReader(filepath)
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                text_cleaned = text.strip()
-                if text_cleaned not in seen_content:
-                    seen_content.add(text_cleaned)
-                    content.append(text_cleaned)
-        return "\n\n".join(content)
-    except ImportError:
-        return "*[Dependency Missing: Install 'pypdf' via pip to parse this PDF document]*"
-    except Exception as e:
-        return f"*Error parsing PDF raw text: {e}*"
+def discover_files(
+    root: Path,
+    output_path: Path,
+    extra_excludes: set[str],
+) -> list[Path]:
+    """Return sorted list of supported files under *root*, skipping excluded dirs."""
+    exclude_dirs = DEFAULT_EXCLUDE_DIRS | extra_excludes
+    found: list[Path] = []
 
-def extract_pptx_content(filepath):
-    """Extracts visual slide text segments from PowerPoint presentations."""
-    try:
-        from pptx import Presentation
-        content = []
-        prs = Presentation(filepath)
-        for i, slide in enumerate(prs.slides, start=1):
-            slide_text = []
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    text_line = shape.text.strip()
-                    if text_line not in seen_content:
-                        seen_content.add(text_line)
-                        slide_text.append(text_line)
-            if slide_text:
-                content.append(f"### Slide {i}\n" + "\n".join(slide_text))
-        return "\n\n".join(content)
-    except ImportError:
-        return "*[Dependency Missing: Install 'python-pptx' via pip to parse this PowerPoint presentation]*"
-    except Exception as e:
-        return f"*Error parsing presentation text blocks: {e}*"
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.resolve() == output_path:
+            continue
+        # Skip if any path component is an excluded directory name
+        if any(part in exclude_dirs for part in path.parts):
+            continue
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            found.append(path)
 
-def extract_tabular_content(filepath, is_csv=True):
-    """Parses structural tables (CSV/TSV/Excel) converting them into elegant Markdown matrices."""
-    try:
-        import pandas as pd
-        # Choose delimiter engine based on actual extension signatures
-        if filepath.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(filepath)
+    found.sort()
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Output writing
+# ---------------------------------------------------------------------------
+
+def write_output(
+    output_path: Path,
+    root: Path,
+    files: list[Path],
+    toc: list[str],
+    sections: list[str],
+    processed: int,
+    included: int,
+    dedup: Optional[Deduplicator],
+) -> None:
+    with open(output_path, "w", encoding="utf-8") as out:
+        out.write("# Merged Document\n\n")
+
+        out.write("## Table of Contents\n\n")
+        out.write("\n".join(toc))
+        out.write("\n")
+
+        for section in sections:
+            out.write(section)
+
+        out.write("\n---\n")
+        out.write("## Statistics\n\n")
+        out.write(f"- Files discovered: {len(files)}\n")
+        out.write(f"- Files processed: {processed}\n")
+        out.write(f"- Files included: {included}\n")
+        if dedup is not None:
+            out.write(f"- Duplicate blocks removed: {dedup.duplicates_removed}\n")
         else:
-            delimiter = ',' if is_csv else '\t'
-            df = pd.read_csv(filepath, sep=delimiter)
-        
-        if len(df) > 50:
-            table_md = df.head(50).to_markdown(index=False)
-            return table_md + f"\n\n*Note: Table truncated dynamically. Displaying first 50 rows out of {len(df)} total rows.*\n"
-        return df.to_markdown(index=False)
-    except ImportError:
-        # If pandas/tabulate are missing, treat CSV/TSV as code blocks so raw data is still preserved
-        raw_text = read_text_with_fallback_encodings(filepath)
-        return f"*Note: Table formatting missing (pip install pandas tabulate). Rendering raw rows.*\n\n```text\n{raw_text}\n```"
-    except Exception as e:
-        return f"*Error parsing structured data matrix: {e}*"
+            out.write("- Deduplication: disabled\n")
 
-def main():
-    print("==================================================")
-    print("        Universal Code & File Merger Tool         ")
-    print("==================================================")
-    
-    # 1. SCAN DIRECTORY AND APPLY STRATEGIC EXCLUSION RULES
-    all_files = []
-    try:
-        for f in os.listdir('.'):
-            if os.path.isdir(f):
-                continue
-            
-            # CRITICAL SAFETY HOOKS
-            if f == SCRIPT_SELF_NAME:
-                continue
-            if os.path.abspath(f) == OUTPUT_FILEPATH_ABS:
-                continue
-                
-            if f.lower().endswith(ALL_SUPPORTED_EXTENSIONS):
-                all_files.append(f)
-    except Exception as e:
-        print(f"[-] Critical failure evaluating target folder path contents: {e}")
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fileMerger",
+        description=(
+            "Recursively scan a directory, extract text from supported files, "
+            "and combine everything into a single Markdown document."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Supported formats:
+  .txt  .md  .json  .csv  .xlsx  .pdf  .docx  .pptx  .ipynb
+
+Examples:
+  python fileMerger.py
+  python fileMerger.py --directory ./docs --output merged.md
+  python fileMerger.py --no-dedup --verbose
+  python fileMerger.py --exclude tests fixtures --csv-limit 100
+        """,
+    )
+
+    parser.add_argument(
+        "--directory", "-d",
+        default=".",
+        metavar="DIR",
+        help="Directory to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="merged.md",
+        metavar="FILE",
+        help="Output Markdown filename (default: merged.md)",
+    )
+    parser.add_argument(
+        "--csv-limit",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Max rows to include from CSV/XLSX files; 0 = unlimited (default: 50)",
+    )
+    parser.add_argument(
+        "--json-limit",
+        type=int,
+        default=50_000,
+        metavar="N",
+        help="Max characters to include from JSON files; 0 = unlimited (default: 50000)",
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=[],
+        metavar="DIR",
+        help="Additional directory names to exclude (e.g. --exclude tests fixtures)",
+    )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Disable duplicate content removal",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Print each file as it is processed",
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress all output except errors",
+    )
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.verbose and args.quiet:
+        parser.error("--verbose and --quiet are mutually exclusive")
+
+    root = Path(args.directory).resolve()
+    if not root.is_dir():
+        print(f"Error: '{root}' is not a directory.", file=sys.stderr)
         sys.exit(1)
 
-    all_files.sort()
-    total_count = len(all_files)
-    print(f"[+] Found {total_count} matching files to process safely.\n")
+    output_path = Path(args.output).resolve()
+    extra_excludes = set(args.exclude)
+    dedup: Optional[Deduplicator] = None if args.no_dedup else Deduplicator()
 
-    if total_count == 0:
-        print("[!] No supported file structures discovered in the running directory path.")
-        return
+    # ── Discover files ──────────────────────────────────────────────────────
+    if not args.quiet:
+        print(f"Scanning: {root}")
 
-    # 2. RUN EXTRACTION PIPELINES WITH TOTAL ISOLATION PROTECTION
-    processed_count = 0
-    with open(OUTPUT_FILENAME, 'w', encoding='utf-8') as outfile:
-        outfile.write("# Combined Comprehensive Project Manifest\n\n")
-        outfile.write(f"This document houses all project elements automatically generated via `{SCRIPT_SELF_NAME}`.\n\n")
-        
-        for index, filename in enumerate(all_files, start=1):
-            ext = os.path.splitext(filename)[1].lower()
-            print(f"[{index}/{total_count}] Processing: {filename}...")
-            
-            text_payload = ""
-            
-            # Routing engines based on absolute file type extensions
-            if ext == '.ipynb':
-                text_payload = extract_notebook_content(filename)
-            elif ext == '.docx':
-                text_payload = extract_docx_content(filename)
-            elif ext == '.pdf':
-                text_payload = extract_pdf_content(filename)
-            elif ext in ('.pptx', '.ppt'):
-                text_payload = extract_pptx_content(filename)
-            elif ext in ('.xlsx', '.xls'):
-                text_payload = extract_tabular_content(filename, is_csv=False)
-            elif ext == '.csv':
-                text_payload = extract_tabular_content(filename, is_csv=True)
-            elif ext == '.tsv':
-                text_payload = extract_tabular_content(filename, is_csv=False)
-            elif ext in CODE_EXTENSIONS:
-                # Standard script/plain text file extraction
-                raw_code = read_text_with_fallback_encodings(filename)
-                if raw_code and raw_code not in seen_content:
-                    seen_content.add(raw_code)
-                    lang = CODE_EXTENSIONS[ext]
-                    text_payload = f"```{lang}\n{raw_code}\n```"
-            
-            # Commit unique extracted elements cleanly into the master document file
-            if text_payload and text_payload.strip():
-                outfile.write(f"\n\n---\n## File Component: {filename}\n---\n\n")
-                outfile.write(text_payload)
-                processed_count += 1
-            else:
-                print(f"  -> Skipped: No unique text blocks extracted or contents are entirely duplicated.")
+    files = discover_files(root, output_path, extra_excludes)
 
-    print("\n==================================================")
-    print(f"[✓] Execution successful! Compiled {processed_count} files.")
-    print(f"[+] Output generated: '{OUTPUT_FILENAME}'")
-    print("==================================================")
+    if not args.quiet:
+        print(f"Found {len(files)} supported file(s).\n")
+
+    # ── Process files ───────────────────────────────────────────────────────
+    toc: list[str] = []
+    sections: list[str] = []
+    processed = 0
+    included = 0
+
+    iterator = files
+    if HAS_TQDM and not args.quiet and not args.verbose:
+        iterator = tqdm(files, desc="Processing", unit="file")
+
+    for file in iterator:
+        relative = file.relative_to(root)
+        anchor = str(relative).replace("\\", "/")
+
+        if args.verbose:
+            print(f"  → {anchor}")
+
+        content = extract_file(file, dedup, args.csv_limit, args.json_limit)
+        processed += 1
+
+        if not content.strip():
+            if args.verbose:
+                print(f"     (empty or duplicate — skipped)")
+            continue
+
+        included += 1
+        toc.append(f"- [{anchor}](#{anchor.replace('/', '').replace('.', '').replace(' ', '-').lower()})")
+        sections.append(f"\n---\n\n## {anchor}\n\n{content}\n")
+
+    # ── Write output ────────────────────────────────────────────────────────
+    write_output(
+        output_path, root, files, toc, sections,
+        processed, included, dedup,
+    )
+
+    if not args.quiet:
+        print(f"\n✓ Output written to: {output_path}")
+        print(f"  Files included : {included}/{processed}")
+        if dedup is not None:
+            print(f"  Duplicates removed: {dedup.duplicates_removed}")
+
 
 if __name__ == "__main__":
     main()
