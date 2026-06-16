@@ -25,7 +25,7 @@ Useful for feeding a codebase or document folder into an LLM context window, cre
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/fileMerger.git
+git clone https://github.com/Rajallah/fileMerger.git
 cd fileMerger
 pip install -r requirements.txt
 ```
